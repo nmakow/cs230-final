@@ -14,7 +14,10 @@ class pix2pix(object):
                  batch_size=1, sample_size=1, output_size=256,
                  gf_dim=64, df_dim=64, L1_lambda=100,
                  input_c_dim=3, output_c_dim=3, dataset_name='facades',
-                 checkpoint_dir=None, sample_dir=None):
+                 checkpoint_dir=None, sample_dir=None,
+		 experiment_name="experiment", 
+                 wgan=False, citers=5, clip_values=(-0.01, 0.01),
+                 gp=False, gp_weight=10):
         """
 
         Args:
@@ -32,6 +35,12 @@ class pix2pix(object):
         self.image_size = image_size
         self.sample_size = sample_size
         self.output_size = output_size
+        self.experiment_name = experiment_name
+        self.wgan = wgan
+        self.citers = citers # num iters to update critic for each gen update 
+        self.clip_values = clip_values # values for WGAN clipping
+        self.gp = gp # Use gradient penalty for WGAN?
+        self.gp_weight = gp_weight # coefficient for gradient penalty in WGAN
 
         self.gf_dim = gf_dim
         self.df_dim = df_dim
@@ -63,7 +72,9 @@ class pix2pix(object):
         self.g_bn_d7 = batch_norm(name='g_bn_d7')
 
         self.dataset_name = dataset_name
-        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_dir = checkpoint_dir + "/" + self.experiment_name
+        self.sample_dir = sample_dir + "/" + self.experiment_name
+        print("Model built w/ checkpoint_dir: %s, sample_dir: %s" % (self.checkpoint_dir, self.sample_dir))
         self.build_model()
 
     def build_model(self):
@@ -88,18 +99,40 @@ class pix2pix(object):
         self.d__sum = tf.summary.histogram("d_", self.D_)
         self.fake_B_sum = tf.summary.image("fake_B", self.fake_B)
 
-        self.d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits, labels=tf.ones_like(self.D)))
-        self.d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits_, labels=tf.zeros_like(self.D_)))
-        self.g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits_, labels=tf.ones_like(self.D_))) \
+	# WGAN loss
+        if self.wgan:
+            self.d_loss = tf.reduce_mean(self.D_logits - self.D_logits_)
+            if self.gp:
+                alpha_dist = tf.contrib.distributions.Uniform(low=0.0, high=1.0)
+                alpha = alpha_dist.sample((self.batch_size, 1, 1, 1))
+                interpolated = self.real_AB + alpha * (self.fake_AB - self.real_AB)
+                inte_logit = self.discriminator(interpolated, reuse=True)
+                gradients = tf.gradients(inte_logit, [interpolated,])[0]
+                grad_l2 = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1,2,3]))
+                gradient_penalty = tf.reduce_mean((grad_l2 - 1)**2)
+                gp_loss_sum = tf.summary.scalar("gp_loss", gradient_penalty)
+                grad = tf.summary.scalar("grad_norm", tf.nn.l2_loss(gradients)) 
+                self.d_loss += self.gp * gradient_penalty
+
+            self.g_loss = tf.reduce_mean(self.D_logits_) \
+                    + self.L1_lambda * tf.reduce_mean(tf.abs(self.real_B - self.fake_B))
+
+            self.d_loss_sum = tf.summary.scalar("d_loss", self.d_loss)
+            self.g_loss_sum = tf.summary.scalar("g_loss", self.g_loss)
+	# Vanilla GAN loss
+        else:
+       	    self.d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits, labels=tf.ones_like(self.D)))
+            self.d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits_, labels=tf.zeros_like(self.D_)))
+            self.g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=self.D_logits_, labels=tf.ones_like(self.D_))) \
                         + self.L1_lambda * tf.reduce_mean(tf.abs(self.real_B - self.fake_B))
 
-        self.d_loss_real_sum = tf.summary.scalar("d_loss_real", self.d_loss_real)
-        self.d_loss_fake_sum = tf.summary.scalar("d_loss_fake", self.d_loss_fake)
+            self.d_loss_real_sum = tf.summary.scalar("d_loss_real", self.d_loss_real)
+            self.d_loss_fake_sum = tf.summary.scalar("d_loss_fake", self.d_loss_fake)
 
-        self.d_loss = self.d_loss_real + self.d_loss_fake
+            self.d_loss = self.d_loss_real + self.d_loss_fake
 
-        self.g_loss_sum = tf.summary.scalar("g_loss", self.g_loss)
-        self.d_loss_sum = tf.summary.scalar("d_loss", self.d_loss)
+            self.g_loss_sum = tf.summary.scalar("g_loss", self.g_loss)
+            self.d_loss_sum = tf.summary.scalar("d_loss", self.d_loss)
 
         t_vars = tf.trainable_variables()
 
@@ -125,24 +158,44 @@ class pix2pix(object):
             [self.fake_B_sample, self.d_loss, self.g_loss],
             feed_dict={self.real_data: sample_images}
         )
+        print('saving images to %s' % sample_dir)
         save_images(samples, [self.batch_size, 1],
                     './{}/train_{:02d}_{:04d}.png'.format(sample_dir, epoch, idx))
         print("[Sample] d_loss: {:.8f}, g_loss: {:.8f}".format(d_loss, g_loss))
 
+    
+    def _get_optimizers(self, args):
+        if self.wgan:
+            d_optim = tf.train.RMSPropOptimizer(args.lr).minimize(self.d_loss, var_list=self.d_vars)
+            g_optim = tf.train.RMSPropOptimizer(args.lr).minimize(self.g_loss, var_list=self.g_vars)
+        else:
+            d_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
+                              .minimize(self.d_loss, var_list=self.d_vars)
+            g_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
+                              .minimize(self.g_loss, var_list=self.g_vars)
+        return d_optim, g_optim
+
+
+
+
     def train(self, args):
         """Train pix2pix"""
-        d_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
-                          .minimize(self.d_loss, var_list=self.d_vars)
-        g_optim = tf.train.AdamOptimizer(args.lr, beta1=args.beta1) \
-                          .minimize(self.g_loss, var_list=self.g_vars)
+        d_optim, g_optim = self._get_optimizers(args)
+
+        clip_d_var_op = [var.assign(tf.clip_by_value(var, self.clip_values[0], self.clip_values[1])) for
+                         var in self.d_vars]
 
         init_op = tf.global_variables_initializer()
         self.sess.run(init_op)
 
-        self.g_sum = tf.summary.merge([self.d__sum,
-            self.fake_B_sum, self.d_loss_fake_sum, self.g_loss_sum])
-        self.d_sum = tf.summary.merge([self.d_sum, self.d_loss_real_sum, self.d_loss_sum])
-        self.writer = tf.summary.FileWriter("./logs", self.sess.graph)
+        if self.wgan:
+            self.g_sum = tf.summary.merge([self.d__sum, self.fake_B_sum, self.g_loss_sum])
+            self.d_sum = tf.summary.merge([self.d_sum, self.d_loss_sum])
+        else:
+            self.g_sum = tf.summary.merge([self.d__sum,
+                self.fake_B_sum, self.d_loss_fake_sum, self.g_loss_sum])
+            self.d_sum = tf.summary.merge([self.d_sum, self.d_loss_real_sum, self.d_loss_sum])
+        self.writer = tf.summary.FileWriter("./logs/" + self.experiment_name, self.sess.graph)
 
         counter = 1
         start_time = time.time()
@@ -166,34 +219,53 @@ class pix2pix(object):
                     batch_images = np.array(batch).astype(np.float32)
 
                 # Update D network
-                _, summary_str = self.sess.run([d_optim, self.d_sum],
-                                               feed_dict={ self.real_data: batch_images })
-                self.writer.add_summary(summary_str, counter)
+                if self.wgan:
+	            # for WGAN, critic is updated n_critic times per gen update. Could 
+                    # theoretically be trained to convergence for each generator update.
+                    # we train even more on early iters, and every 500 iters.
+                    if counter < 25 or counter % 500 == 0:
+                        critic_iters = 25
+                    else:
+                        critic_iters = self.citers
+                    for critic_iter in range(critic_iters):
+                        _, summary_str = self.sess.run([d_optim, self.d_sum], 
+                                                       feed_dict={ self.real_data: batch_images })
+			# For WGAN we also clip the discriminator weights
+                        # if not self.gp:
+                        self.sess.run(clip_d_var_op)
+                        self.writer.add_summary(summary_str, counter)
+                else:
+                    _, summary_str = self.sess.run([d_optim, self.d_sum],
+                                                   feed_dict={ self.real_data: batch_images })
+                    self.writer.add_summary(summary_str, counter)
 
                 # Update G network
                 _, summary_str = self.sess.run([g_optim, self.g_sum],
                                                feed_dict={ self.real_data: batch_images })
                 self.writer.add_summary(summary_str, counter)
-
-                # Run g_optim twice to make sure that d_loss does not go to zero (different from paper)
-                _, summary_str = self.sess.run([g_optim, self.g_sum],
-                                               feed_dict={ self.real_data: batch_images })
-                self.writer.add_summary(summary_str, counter)
-
-                errD_fake = self.d_loss_fake.eval({self.real_data: batch_images})
-                errD_real = self.d_loss_real.eval({self.real_data: batch_images})
+		
+                if not self.wgan:
+                    # Run g_optim twice to make sure that d_loss does not go to zero (different from paper)
+                    _, summary_str = self.sess.run([g_optim, self.g_sum],
+                                                   feed_dict={ self.real_data: batch_images })
+                    self.writer.add_summary(summary_str, counter)
+		
+		
+        	# errD_fake = self.d_loss_fake.eval({self.real_data: batch_images})
+                # errD_real = self.d_loss_real.eval({self.real_data: batch_images})
+                errD = self.d_loss.eval({self.real_data: batch_images})
                 errG = self.g_loss.eval({self.real_data: batch_images})
 
                 counter += 1
                 print("Epoch: [%2d] [%4d/%4d] time: %4.4f, d_loss: %.8f, g_loss: %.8f" \
                     % (epoch, idx, batch_idxs,
-                        time.time() - start_time, errD_fake+errD_real, errG))
+                        time.time() - start_time, errD, errG))
 
                 if np.mod(counter, 100) == 1:
-                    self.sample_model(args.sample_dir, epoch, idx)
+                    self.sample_model(self.sample_dir, epoch, idx)
 
                 if np.mod(counter, 500) == 2:
-                    self.save(args.checkpoint_dir, counter)
+                    self.save(self.checkpoint_dir, counter)
 
     def discriminator(self, image, y=None, reuse=False):
 
